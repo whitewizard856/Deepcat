@@ -1,0 +1,81 @@
+{
+  "name": "dsh-shell",
+  "productName": "Deepcat",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Deepcat - a desktop shell for DeepSeek Harness",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/USER/Deepcat.git"
+  },
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node build.mjs && electron .",
+    "typecheck": "tsc --noEmit",
+    "dist": "node build.mjs && electron-builder --win nsis portable --publish never"
+  },
+  "build": {
+    "appId": "dev.deepcat.shell",
+    "productName": "Deepcat",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "dist/**/*",
+      "assets/icon.png",
+      "assets/icon.ico",
+      "assets/prompts/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets/plugins",
+        "to": "plugins"
+      },
+      {
+        "from": "vendor",
+        "to": ".",
+        "filter": ["kernel/**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "shortcutName": "Deepcat"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "electron": "43.4.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+release/
+
+# bundled kernel (0.54 GB, third-party) — see README "内核" section
+vendor/
+
+# runtime logs
+*.log
+logs/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini

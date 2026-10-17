@@ -1,0 +1,1343 @@
+import os from "node:os";
+import path from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { isWshAscii, wshLiteral } from "./official-update.js";
+import { asarArchiveIsFile, hostFs } from "./extract-asar.js";
+
+// 无归档时用 node:fs。app.asar 还在时不能把映射出来的 resources/app 当成已经解开。
+const fs = hostFs;
+
+/** 路径落在 `app.asar/...` 里面。`app.asar` 文件本身和 `app.asar.unpacked` 不算。 */
+export function isAsarSealedPath(p) {
+  const parts = String(p || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.length < 2) return false;
+  return parts.slice(0, -1).some((seg) => {
+    const s = seg.toLowerCase();
+    return s.endsWith(".asar") && !s.endsWith(".asar.unpacked");
+  });
+}
+
+function isFile(fp) {
+  try {
+    if (isAsarSealedPath(fp)) return false;
+    return Boolean(fp) && fs.existsSync(fp) && fs.statSync(fp).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isDir(fp) {
+  try {
+    if (isAsarSealedPath(fp)) return false;
+    return Boolean(fp) && fs.existsSync(fp) && fs.statSync(fp).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isAiBase(p) {
+  return Boolean(p) && isDir(path.join(p, "dsh-agent-instructions", "lib"));
+}
+
+function uniquePaths(list) {
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    if (!item) continue;
+    const n = path.normalize(item);
+    const key = n.replace(/\\/g, "/").toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(n);
+  }
+  return out;
+}
+
+function slashNorm(p) {
+  return path.normalize(String(p || "")).replace(/\\/g, "/").toLowerCase();
+}
+
+function isSubPath(child, root) {
+  const c = slashNorm(child).replace(/\/+$/, "");
+  const r = slashNorm(root).replace(/\/+$/, "");
+  if (!c || !r || r === "/") return false;
+  if (/^[a-z]:$/.test(r)) return false;
+  return c === r || c.startsWith(`${r}/`);
+}
+
+/**
+ * 社区桌面、官方 exe、.app 包才算安装树。
+ * 只是上级文件夹叫 DeepSeek Harness 不算：npm 前缀和配置目录经常用这个名字，
+ * 按名字整棵排除的话，Web 的身份句和 complete 注入补丁会被跳过。
+ */
+export function looksLikeDesktopName(p) {
+  const n = slashNorm(p);
+  if (!n) return false;
+  return (
+    n.includes("/dsh desktop/") ||
+    n.includes("/dsh desktop.app/") ||
+    n.endsWith("/dsh desktop") ||
+    n.endsWith("/dsh desktop.app") ||
+    n.includes("dsh-desktop") ||
+    n.includes("/deepseek harness/") ||
+    n.includes("/deepseek-harness/") ||
+    n.includes("/deepseekharness") ||
+    /\/deepseek[\s._-]*harness(\/|$)/.test(n) ||
+    n.includes("/deepseek harness.app/") ||
+    n.endsWith("/deepseek harness.app") ||
+    /\/dsh desktop\.exe$/i.test(n) ||
+    /\/deepseek[\s._-]*harness\.exe$/i.test(n)
+  );
+}
+
+const OFFICIAL_HARNESS_BASES = new Set([
+  "deepseek harness.exe",
+  "deepseek-harness.exe",
+  "deepseek harness",
+  "deepseek-harness",
+]);
+
+function sameBase(name, expected) {
+  return String(name || "").toLowerCase() === expected;
+}
+
+export function isDesktopExecutable(fp) {
+  const base = path.basename(String(fp || "")).toLowerCase();
+  if (base === "dsh desktop.exe" || base === "dsh desktop") return true;
+  if (OFFICIAL_HARNESS_BASES.has(base)) return true;
+  return /^deepseek[\s._-]*harness(\.exe)?$/.test(base);
+}
+
+/** 只有官方 DeepSeek Harness 会把宿主封进 app.asar 并在「应用」时解开。第三方 DSH Desktop 不走这条。 */
+export function isOfficialHarnessExecutable(fp) {
+  const base = path.basename(String(fp || "")).toLowerCase();
+  if (OFFICIAL_HARNESS_BASES.has(base)) return true;
+  return /^deepseek[\s._-]*harness(\.exe)?$/.test(base);
+}
+
+/** 某个安装目录下可能的 resources 文件夹（mac 大小写敏感盘要 Resources 和 resources 都试）。 */
+export function resourceDirCandidates(installDir) {
+  if (!installDir) return [];
+  const name = path.basename(installDir);
+  if (sameBase(name, "macos")) {
+    const contents = path.dirname(installDir);
+    return [path.join(contents, "Resources"), path.join(contents, "resources")];
+  }
+  if (sameBase(name, "contents")) {
+    return [path.join(installDir, "Resources"), path.join(installDir, "resources")];
+  }
+  if (name.toLowerCase().endsWith(".app")) {
+    return [
+      path.join(installDir, "Contents", "Resources"),
+      path.join(installDir, "Contents", "resources"),
+    ];
+  }
+  if (sameBase(name, "resources")) return [installDir];
+  return [path.join(installDir, "resources"), path.join(installDir, "Resources")];
+}
+
+/** 官方宿主的 resources 目录。已存在的 app.asar 优先，否则用该平台的常规目录名。 */
+export function resourcesDirForExecutable(exe) {
+  const exeDir = path.dirname(path.normalize(String(exe || "")));
+  if (!exeDir) return "";
+  const cands = resourceDirCandidates(exeDir);
+  const withAsar = cands.find((dir) => isFile(path.join(dir, "app.asar")));
+  if (withAsar) return withAsar;
+  const existing = cands.find((dir) => isDir(dir));
+  if (existing) return existing;
+  return cands[0] || "";
+}
+
+export function appAsarPath(exe) {
+  const dir = resourcesDirForExecutable(exe);
+  return dir ? path.join(dir, "app.asar") : "";
+}
+
+export function appDirForExecutable(exe) {
+  const dir = resourcesDirForExecutable(exe);
+  return dir ? path.join(dir, "app") : "";
+}
+
+function exeCandidatesBeside(dir) {
+  if (!dir) return [];
+  return [
+    path.join(dir, "DeepSeek Harness.exe"),
+    path.join(dir, "deepseek-harness.exe"),
+    path.join(dir, "DeepSeek Harness"),
+    path.join(dir, "deepseek-harness"),
+    path.join(dir, "DSH Desktop.exe"),
+    path.join(dir, "DSH Desktop"),
+    path.join(dir, "MacOS", "DeepSeek Harness"),
+    path.join(dir, "MacOS", "deepseek-harness"),
+    path.join(dir, "MacOS", "DSH Desktop"),
+    path.join(dir, "Contents", "MacOS", "DeepSeek Harness"),
+    path.join(dir, "Contents", "MacOS", "deepseek-harness"),
+    path.join(dir, "Contents", "MacOS", "DSH Desktop"),
+  ];
+}
+
+function firstExistingExe(dirs) {
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const cand of exeCandidatesBeside(dir)) {
+      if (isFile(cand)) return path.normalize(cand);
+    }
+  }
+  return "";
+}
+
+const APP_SCRIPT_RE = /(desktop-cli|host-process-entry)\.js$/i;
+
+function installDirsFromAppScript(scriptPath) {
+  if (!scriptPath) return [];
+  const abs = path.resolve(scriptPath);
+  const lib = path.dirname(abs);
+  const app = path.dirname(lib);
+  const resources = path.dirname(app);
+  const install = path.dirname(resources);
+  return uniquePaths([lib, app, resources, install]);
+}
+
+/** 从任意 `.../resources/app/...` 树反推安装目录（不要求文件夹叫 DSH Desktop）。 */
+export function inferDesktopInstallDir(p) {
+  const raw = path.normalize(String(p || "")).replace(/\\/g, "/");
+  const n = raw.toLowerCase();
+  if (!n) return "";
+  const markers = [
+    "/resources/app.asar.unpacked/",
+    "/resources/app/",
+    "/contents/resources/",
+  ];
+  for (const marker of markers) {
+    const i = n.indexOf(marker);
+    if (i <= 0) continue;
+    return path.normalize(raw.slice(0, i));
+  }
+  return "";
+}
+
+function extraInstallsFromEnv(env = process.env) {
+  return String(env.DSH_DESKTOP_INSTALL || "")
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function trustedInstallDir(dir) {
+  if (!dir) return false;
+  if (looksLikeDesktopName(dir)) return true;
+  if (firstExistingExe([dir])) return true;
+  return (
+    isAiBase(path.join(dir, "resources", "app", "dsh", "node_modules", "@deepseek-ai")) ||
+    isAiBase(path.join(dir, "resources", "app", "node_modules", "@deepseek-ai")) ||
+    isAiBase(path.join(dir, "resources", "app.asar.unpacked", "dsh", "node_modules", "@deepseek-ai")) ||
+    isAiBase(path.join(dir, "resources", "app.asar.unpacked", "node_modules", "@deepseek-ai"))
+  );
+}
+
+const REGISTRY_INSTALL_SCRIPT = `
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$names = @('DeepSeek Harness','DSH Desktop')
+$roots = @(
+  'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+)
+$rows = foreach ($root in $roots) {
+  if (-not (Test-Path $root)) { continue }
+  Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+    if (-not $p.DisplayName) { return }
+    $hit = $false
+    foreach ($n in $names) { if ($p.DisplayName -like ('*' + $n + '*')) { $hit = $true } }
+    if (-not $hit) { return }
+    [pscustomobject]@{
+      InstallLocation = [string]$p.InstallLocation
+      DisplayIcon = [string]$p.DisplayIcon
+      UninstallString = [string]$p.UninstallString
+    }
+  }
+}
+if ($rows) { @($rows) | ConvertTo-Json -Compress }
+`.trim();
+
+function exeDirFromRegistryValue(value) {
+  let val = String(value || "").trim();
+  const quoted = val.match(/^"([^"]+)"/);
+  if (quoted) val = quoted[1];
+  val = val.replace(/,0$/, "").trim();
+  if (!val) return "";
+  return path.normalize(path.dirname(val));
+}
+
+let cachedRegistryDirs;
+/** 从卸载登记读安装目录。盘符跟着用户安装位置，不写死。 */
+export function registryInstallDirs() {
+  if (cachedRegistryDirs !== undefined) return cachedRegistryDirs;
+  if (process.platform !== "win32") {
+    cachedRegistryDirs = [];
+    return cachedRegistryDirs;
+  }
+  let text = "";
+  try {
+    text = execFileSync("powershell.exe", ["-NoProfile", "-Command", REGISTRY_INSTALL_SCRIPT], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15000,
+    });
+  } catch {
+    return [];
+  }
+  let rows = [];
+  try {
+    const parsed = JSON.parse(String(text || "").replace(/^\uFEFF/, "").trim() || "[]");
+    rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+  } catch {
+    return [];
+  }
+  const found = [];
+  for (const row of rows) {
+    const location = String(row.InstallLocation || "").trim();
+    if (location) found.push(path.normalize(location));
+    found.push(exeDirFromRegistryValue(row.DisplayIcon));
+    found.push(exeDirFromRegistryValue(row.UninstallString));
+  }
+  cachedRegistryDirs = uniquePaths(found).filter((dir) => firstExistingExe([dir]));
+  return cachedRegistryDirs;
+}
+
+const PORTABLE_INSTALL_NAMES = [
+  "DeepSeek Harness",
+  "DeepseekHarnessDesktop",
+  "DeepSeekHarnessDesktop",
+  "DSH Desktop",
+  "deepseek-harness",
+];
+
+function homeSiblingInstalls(env = process.env) {
+  const homes = [env.DSH_HOME, env.DSH_BASE].filter(Boolean);
+  const dirs = [];
+  for (const raw of homes) {
+    const start = path.normalize(String(raw));
+    dirs.push(start, path.dirname(start), path.dirname(path.dirname(start)));
+  }
+  return uniquePaths(dirs).filter((dir) => firstExistingExe([dir]));
+}
+
+/** 用户目录和各盘根下一层常见文件夹名。不扫整盘。 */
+function portableInstallGuesses(env = process.env) {
+  const home = os.homedir();
+  const cands = [];
+  for (const folder of ["Desktop", "Documents", "Downloads"]) {
+    for (const name of PORTABLE_INSTALL_NAMES) {
+      cands.push(path.join(home, folder, name));
+    }
+  }
+  for (const name of PORTABLE_INSTALL_NAMES) {
+    cands.push(path.join(home, name));
+  }
+  if (process.platform === "win32") {
+    for (const letter of "CDEFGHI") {
+      for (const name of PORTABLE_INSTALL_NAMES) {
+        cands.push(`${letter}:\\${name}`);
+      }
+    }
+  }
+  return uniquePaths(cands).filter((dir) => firstExistingExe([dir]));
+}
+
+function walkParentsForOfficialExe(start, maxUp = 8) {
+  if (!start) return "";
+  let dir = "";
+  try {
+    const abs = path.resolve(String(start));
+    dir = isDir(abs) ? abs : path.dirname(abs);
+  } catch {
+    return "";
+  }
+  for (let i = 0; i < maxUp && dir; i += 1) {
+    const hit = firstExistingExe([dir]);
+    if (hit) return hit;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return "";
+}
+
+const PROCESS_EXE_SCRIPT = `
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$re = 'DeepSeek Harness\\.exe$|deepseek-harness\\.exe$|DSH Desktop\\.exe$'
+$paths = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+  Where-Object { $_.ExecutablePath -and $_.ExecutablePath -match $re } |
+  Select-Object -ExpandProperty ExecutablePath)
+if ($paths) { @($paths) | ConvertTo-Json -Compress }
+`.trim();
+
+let cachedRunningExes;
+function runningOfficialExecutables() {
+  if (cachedRunningExes !== undefined) return cachedRunningExes;
+  if (process.platform !== "win32") {
+    cachedRunningExes = [];
+    return cachedRunningExes;
+  }
+  let text = "";
+  try {
+    text = execFileSync("powershell.exe", ["-NoProfile", "-Command", PROCESS_EXE_SCRIPT], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15000,
+    });
+  } catch {
+    // 探测失败不缓存空结果，否则整次进程都找不到正在跑的客户端。
+    return [];
+  }
+  let rows = [];
+  try {
+    const parsed = JSON.parse(String(text || "").replace(/^\uFEFF/, "").trim() || "[]");
+    rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+  } catch {
+    return [];
+  }
+  cachedRunningExes = uniquePaths(rows.map((item) => String(item || "").trim()).filter((fp) => isDesktopExecutable(fp) && isFile(fp)));
+  return cachedRunningExes;
+}
+
+const SHORTCUT_EXE_SCRIPT = `
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$shell = New-Object -ComObject WScript.Shell
+$roots = @(
+  [Environment]::GetFolderPath('StartMenu'),
+  [Environment]::GetFolderPath('CommonStartMenu'),
+  [Environment]::GetFolderPath('Desktop'),
+  [Environment]::GetFolderPath('CommonDesktopDirectory')
+) | Where-Object { $_ }
+$pats = @('*DeepSeek*Harness*.lnk','*DSH Desktop*.lnk','*deepseek-harness*.lnk')
+$out = New-Object System.Collections.Generic.List[string]
+foreach ($root in $roots) {
+  if (-not (Test-Path -LiteralPath $root)) { continue }
+  foreach ($pat in $pats) {
+    Get-ChildItem -LiteralPath $root -Filter $pat -Recurse -ErrorAction SilentlyContinue |
+      Select-Object -First 16 | ForEach-Object {
+        try {
+          $t = $shell.CreateShortcut($_.FullName).TargetPath
+          if ($t) { $out.Add([string]$t) }
+        } catch {}
+      }
+  }
+}
+if ($out.Count) { @($out) | ConvertTo-Json -Compress }
+`.trim();
+
+let cachedShortcutExes;
+function shortcutOfficialExecutables() {
+  if (cachedShortcutExes !== undefined) return cachedShortcutExes;
+  if (process.platform !== "win32") {
+    cachedShortcutExes = [];
+    return cachedShortcutExes;
+  }
+  let text = "";
+  try {
+    text = execFileSync("powershell.exe", ["-NoProfile", "-Command", SHORTCUT_EXE_SCRIPT], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15000,
+    });
+  } catch {
+    return [];
+  }
+  let rows = [];
+  try {
+    const parsed = JSON.parse(String(text || "").replace(/^\uFEFF/, "").trim() || "[]");
+    rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+  } catch {
+    return [];
+  }
+  cachedShortcutExes = uniquePaths(rows.map((item) => String(item || "").trim()).filter((fp) => isDesktopExecutable(fp) && isFile(fp)));
+  return cachedShortcutExes;
+}
+
+/** 点「应用」前清掉失败的空缓存，重新找本机 exe。 */
+export function clearDesktopLocateCache() {
+  cachedRunningExes = undefined;
+  cachedShortcutExes = undefined;
+  cachedRegistryDirs = undefined;
+}
+
+function extraDiscoveredInstallDirs(env = process.env) {
+  return uniquePaths([
+    ...homeSiblingInstalls(env),
+    ...portableInstallGuesses(env),
+    ...runningOfficialExecutables().map((exe) => path.dirname(exe)),
+    ...shortcutOfficialExecutables().map((exe) => path.dirname(exe)),
+  ]);
+}
+
+/** NSIS / 商店默认位置；不是全盘扫描。自定义目录还看进程、快捷方式、各盘根下一层常见名。 */
+export function commonDesktopInstallDirs(env = process.env) {
+  const home = os.homedir();
+  const local = env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+  const pf = env.ProgramFiles || "";
+  const pf86 = env["ProgramFiles(x86)"] || "";
+  return uniquePaths([
+    ...extraInstallsFromEnv(env).filter(trustedInstallDir),
+    ...registryInstallDirs(),
+    ...extraDiscoveredInstallDirs(env),
+    path.join(local, "Programs", "DeepSeek Harness"),
+    path.join(local, "Programs", "DSH Desktop"),
+    path.join(local, "DeepSeek Harness"),
+    ...(pf
+      ? [path.join(pf, "DeepSeek Harness"), path.join(pf, "DSH Desktop")]
+      : []),
+    ...(pf86
+      ? [path.join(pf86, "DeepSeek Harness"), path.join(pf86, "DSH Desktop")]
+      : []),
+    "/Applications/DeepSeek Harness.app",
+    "/Applications/DSH Desktop.app",
+    path.join(home, "Applications", "DeepSeek Harness.app"),
+    path.join(home, "Applications", "DSH Desktop.app"),
+    "/opt/DeepSeek Harness",
+    "/opt/deepseek-harness",
+    "/usr/lib/DeepSeek Harness",
+    "/usr/lib/deepseek-harness",
+    "/usr/share/deepseek-harness",
+    path.join(home, ".local", "share", "DeepSeek Harness"),
+    path.join(home, ".local", "share", "deepseek-harness"),
+    "/opt/DSH Desktop",
+    "/usr/lib/dsh-desktop",
+  ]);
+}
+
+export function listDesktopInstallRoots(input = {}) {
+  const execPath = input.execPath ?? process.execPath;
+  const resourcesPath = input.resourcesPath ?? process.resourcesPath;
+  const argv = input.argv ?? process.argv;
+  const env = input.env ?? process.env;
+  const roots = [];
+
+  if (isDesktopExecutable(execPath)) {
+    const dir = path.dirname(path.normalize(execPath));
+    roots.push(dir);
+    if (sameBase(path.basename(dir), "macos")) {
+      const contents = path.dirname(dir);
+      roots.push(
+        contents,
+        path.join(contents, "Resources"),
+        path.join(contents, "resources"),
+        path.dirname(contents),
+      );
+    }
+  }
+
+  if (resourcesPath) {
+    const res = path.normalize(resourcesPath);
+    roots.push(res, path.dirname(res), path.join(res, "app"), path.join(res, "app.asar.unpacked"));
+  }
+
+  for (const arg of argv) {
+    if (typeof arg === "string" && APP_SCRIPT_RE.test(arg)) {
+      roots.push(...installDirsFromAppScript(arg));
+    }
+  }
+
+  for (const extra of extraInstallsFromEnv(env)) {
+    if (trustedInstallDir(extra)) roots.push(extra);
+  }
+  return uniquePaths(roots);
+}
+
+/**
+ * 是否落在社区 Desktop 安装树。
+ * 不依赖盘符、也不要求文件夹叫 “DSH Desktop”：
+ * 当前进程的 exe / resources / host-process-entry、旁边真有桌面 exe，或社区安装目录名。
+ */
+export function isInsideDesktopInstall(p, input = {}) {
+  if (!p) return false;
+  if (looksLikeDesktopName(p)) return true;
+  const roots = listDesktopInstallRoots(input);
+  if (roots.some((root) => isSubPath(p, root))) return true;
+  const inferred = inferDesktopInstallDir(p);
+  if (!inferred) return false;
+  if (roots.some((root) => isSubPath(inferred, root) || isSubPath(root, inferred))) return true;
+  return Boolean(firstExistingExe([inferred]));
+}
+
+export function findDesktopAppExecutable(input = {}) {
+  const execPath = input.execPath ?? process.execPath;
+  const resourcesPath = input.resourcesPath ?? process.resourcesPath;
+  const argv = input.argv ?? process.argv;
+  const env = input.env ?? process.env;
+
+  if (isDesktopExecutable(execPath) && isFile(execPath)) return path.normalize(execPath);
+
+  if (resourcesPath) {
+    const hit = firstExistingExe([path.dirname(path.normalize(resourcesPath))]);
+    if (hit) return hit;
+  }
+
+  for (const arg of argv) {
+    if (typeof arg !== "string" || !APP_SCRIPT_RE.test(arg)) continue;
+    const hit = firstExistingExe(installDirsFromAppScript(arg));
+    if (hit) return hit;
+  }
+
+  const walkStarts = [execPath, resourcesPath, env.DSH_HOME, env.DSH_BASE];
+  try { walkStarts.push(process.cwd()); } catch { /* ignore */ }
+  for (const arg of argv) {
+    if (typeof arg === "string") walkStarts.push(arg);
+  }
+  for (const start of walkStarts) {
+    const hit = walkParentsForOfficialExe(start);
+    if (hit) return hit;
+  }
+
+  const running = runningOfficialExecutables();
+  if (running[0]) return running[0];
+
+  const shortcuts = shortcutOfficialExecutables();
+  if (shortcuts[0]) return shortcuts[0];
+
+  const guessed = firstExistingExe([
+    ...extraInstallsFromEnv(env),
+    ...commonDesktopInstallDirs(env),
+  ]);
+  return guessed || "";
+}
+
+function packageRootsFromInstall(installDir) {
+  if (!installDir) return [];
+  const out = [];
+  for (const resources of resourceDirCandidates(installDir)) {
+    out.push(
+      path.join(resources, "app", "dsh", "node_modules", "@deepseek-ai"),
+      path.join(resources, "app", "node_modules", "@deepseek-ai"),
+      path.join(resources, "app.asar.unpacked", "dsh", "node_modules", "@deepseek-ai"),
+      path.join(resources, "app.asar.unpacked", "node_modules", "@deepseek-ai"),
+    );
+  }
+  return out;
+}
+
+export function listDesktopPackageRoots(input = {}) {
+  const execPath = input.execPath ?? process.execPath;
+  const resourcesPath = input.resourcesPath ?? process.resourcesPath;
+  const argv = input.argv ?? process.argv;
+  const env = input.env ?? process.env;
+  const cands = [];
+
+  if (resourcesPath) {
+    cands.push(
+      path.join(resourcesPath, "app", "dsh", "node_modules", "@deepseek-ai"),
+      path.join(resourcesPath, "app", "node_modules", "@deepseek-ai"),
+      path.join(resourcesPath, "app.asar.unpacked", "dsh", "node_modules", "@deepseek-ai"),
+      path.join(resourcesPath, "app.asar.unpacked", "node_modules", "@deepseek-ai"),
+    );
+  }
+
+  if (isDesktopExecutable(execPath)) {
+    cands.push(...packageRootsFromInstall(path.dirname(execPath)));
+  }
+
+  const exe = findDesktopAppExecutable(input);
+  if (exe) cands.push(...packageRootsFromInstall(path.dirname(exe)));
+
+  for (const arg of argv) {
+    if (typeof arg !== "string" || !APP_SCRIPT_RE.test(arg)) continue;
+    const appDir = path.dirname(path.dirname(path.resolve(arg)));
+    cands.push(path.join(appDir, "node_modules", "@deepseek-ai"));
+    cands.push(path.join(appDir, "dsh", "node_modules", "@deepseek-ai"));
+    cands.push(...packageRootsFromInstall(path.dirname(path.dirname(appDir))));
+  }
+
+  const localHits = uniquePaths(cands).filter(isAiBase);
+  // 已经在某个桌面 exe 里时，只改这一份。旁边装了另一种客户端也不能被带上。
+  if (isDesktopExecutable(execPath)) return localHits;
+
+  for (const install of commonDesktopInstallDirs(env)) {
+    cands.push(...packageRootsFromInstall(install));
+  }
+
+  return uniquePaths(cands).filter(isAiBase);
+}
+
+export function resolveDesktopAiBase(input = {}) {
+  return listDesktopPackageRoots(input)[0] || null;
+}
+
+export function resolveDesktopCliScript(input = {}) {
+  const exe = findDesktopAppExecutable(input);
+  if (exe) {
+    const resources = resourcesDirForExecutable(exe);
+    const packed = path.join(resources, "app", "lib", "desktop-cli.js");
+    if (isFile(packed)) return path.normalize(packed);
+    const unpacked = path.join(resources, "app.asar.unpacked", "lib", "desktop-cli.js");
+    if (isFile(unpacked)) return path.normalize(unpacked);
+  }
+  for (const arg of input.argv ?? process.argv) {
+    if (typeof arg === "string" && /desktop-cli\.js$/i.test(arg) && isFile(arg)) {
+      return path.normalize(path.resolve(arg));
+    }
+  }
+  return "";
+}
+
+export function cliInvocation(input = {}) {
+  const exe = findDesktopAppExecutable(input);
+  const cli = resolveDesktopCliScript(input);
+  if (!exe || !cli) return null;
+  return {
+    execPath: exe,
+    argvPrefix: ["--expose-internals", cli],
+    env: {
+      ELECTRON_RUN_AS_NODE: "1",
+      DSH_DESKTOP_DEFAULT_PROFILE: "desktop",
+    },
+  };
+}
+
+export function isSealedRuntimeDir(dir) {
+  if (!dir) return false;
+  const n = path.normalize(dir).replace(/\\/g, "/").toLowerCase();
+  if (!/(^|\/)bin\/?$/.test(n)) return false;
+  return (
+    n.includes("/host-commands/") ||
+    n.includes("/runtime-commands/") ||
+    n.includes("/dsh desktop/")
+  );
+}
+
+export function sealedRuntimeRoots(env = process.env) {
+  const home = os.homedir();
+  const appdata = env.APPDATA || path.join(home, "AppData", "Roaming");
+  const localapp = env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+  return uniquePaths([
+    path.join(appdata, "DSH Desktop", "host-commands"),
+    path.join(appdata, "DSH Desktop", "runtime-commands"),
+    path.join(localapp, "DSH Desktop", "host-commands"),
+    path.join(localapp, "DSH Desktop", "runtime-commands"),
+    path.join(home, "Library", "Application Support", "DSH Desktop", "host-commands"),
+  ]);
+}
+
+function walkBinDirs(dir, out, depth) {
+  if (depth < 0 || !isDir(dir)) return;
+  const n = dir.replace(/\\/g, "/").toLowerCase();
+  if (/(^|\/)bin$/.test(n)) {
+    out.push(path.normalize(dir));
+    return;
+  }
+  let ents = [];
+  try {
+    ents = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of ents) {
+    if (ent.isDirectory()) walkBinDirs(path.join(dir, ent.name), out, depth - 1);
+  }
+}
+
+export function listSealedRuntimeBins(env = process.env) {
+  const out = [];
+  for (const root of sealedRuntimeRoots(env)) walkBinDirs(root, out, 5);
+  return uniquePaths(out).filter(isSealedRuntimeDir);
+}
+
+export function restartNote() {
+  return "正在重启桌面应用…";
+}
+
+export function restartPlan(input = {}) {
+  const exe = findDesktopAppExecutable(input);
+  if (!exe) {
+    return { kind: "desktop", execPath: "", argv: [], cwd: "", error: "未找到 DSH Desktop.exe，无法重启桌面应用" };
+  }
+  return {
+    kind: "desktop",
+    execPath: exe,
+    argv: [],
+    cwd: path.dirname(exe),
+  };
+}
+
+function helperEnv(payload) {
+  const env = { ...process.env };
+  delete env.DSH_PERMISSION_MODE;
+  env.ELECTRON_RUN_AS_NODE = "1";
+  env.DSH_PURGE_RESTART = JSON.stringify(payload);
+  return env;
+}
+
+function spawnHelper(helper, payload, opts = {}) {
+  const plan = restartPlan();
+  if (!plan.execPath) throw new Error(plan.error || "未找到 DSH Desktop.exe，无法重启桌面应用");
+  const child = spawn(process.execPath, [helper], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    shell: false,
+    env: helperEnv({
+      kind: "desktop",
+      execPath: plan.execPath,
+      argv: plan.argv,
+      cwd: plan.cwd,
+      pid: process.pid,
+      ...payload,
+    }),
+  });
+  child.unref();
+  if (opts.exit !== false) setTimeout(() => process.exit(0), opts.exitAfter ?? 250);
+}
+
+function desktopRuntimeOf(ctx) {
+  if (!ctx || typeof ctx.get !== "function") return null;
+  const runtime = ctx.get("desktopRuntime") || ctx.get("desktopActions");
+  return runtime && typeof runtime.requestRestart === "function" ? runtime : null;
+}
+
+const ASAR_SWAP_PS1 = [
+  "param(",
+  "  [Parameter(Mandatory = $true)][int]$WaitPid,",
+  "  [Parameter(Mandatory = $true)][string]$AsarPath,",
+  "  [Parameter(Mandatory = $true)][string]$ExePath",
+  ")",
+  "$ErrorActionPreference = 'Continue'",
+  "$names = @('DeepSeek Harness', 'DSH Desktop')",
+  "$installRoot = (Split-Path -Parent $ExePath).TrimEnd('\\')",
+  "$exeNorm = $ExePath.ToLower()",
+  "function Stop-HarnessInstall {",
+  "  foreach ($n in $names) {",
+  "    & taskkill.exe /F /T /IM ($n + '.exe') 2>$null | Out-Null",
+  "  }",
+  "  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {",
+  "    $ep = $_.ExecutablePath",
+  "    if (-not $ep) { return $false }",
+  "    $low = $ep.ToLower()",
+  "    return ($low -eq $exeNorm) -or $low.StartsWith($installRoot.ToLower() + '\\')",
+  "  } | ForEach-Object {",
+  "    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
+  "  }",
+  "}",
+  "$deadline = (Get-Date).AddSeconds(120)",
+  "while ((Get-Date) -lt $deadline) {",
+  "  $self = Get-Process -Id $WaitPid -ErrorAction SilentlyContinue",
+  "  $holding = @(Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object {",
+  "    try { $_.Path -and ($_.Path.ToLower() -eq $exeNorm -or $_.Path.ToLower().StartsWith($installRoot.ToLower() + '\\')) } catch { $false }",
+  "  })",
+  "  if (-not $self -and $holding.Count -eq 0) { break }",
+  "  Start-Sleep -Milliseconds 300",
+  "}",
+  "Stop-HarnessInstall",
+  "Start-Sleep -Seconds 2",
+  "Stop-HarnessInstall",
+  "Start-Sleep -Seconds 1",
+  "$appDir = Join-Path (Split-Path -Parent $AsarPath) 'app'",
+  "$unpacked = $AsarPath + '.unpacked'",
+  "$marker = Join-Path $appDir 'dsh\\node_modules\\node-addon-require-builtin-win32-x64-msvc\\prebuilt\\win32-x64-msvc-napi-v9.node'",
+  "if ((Test-Path -LiteralPath $unpacked) -and -not (Test-Path -LiteralPath $marker)) {",
+  "  & robocopy.exe $unpacked $appDir /E /XC /XN /XO /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null",
+  "}",
+  "$moved = -not (Test-Path -LiteralPath $AsarPath)",
+  "if (Test-Path -LiteralPath $AsarPath) {",
+  "  $bak = \"$AsarPath.bak\"",
+  "  if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }",
+  "  for ($i = 0; $i -lt 80; $i++) {",
+  "    try {",
+  "      Move-Item -LiteralPath $AsarPath -Destination $bak -Force",
+  "      $moved = $true",
+  "      break",
+  "    } catch {",
+  "      if ($i -eq 20 -or $i -eq 50) { Stop-HarnessInstall; Start-Sleep -Seconds 1 }",
+  "      Start-Sleep -Milliseconds 400",
+  "    }",
+  "  }",
+  "}",
+  "$lock = $AsarPath + '.rename-pending'",
+  "if ($moved) {",
+  "  Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue",
+  "  Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue",
+  "  Start-Process -FilePath $ExePath",
+  "} else {",
+  "  Set-Content -LiteralPath $lock -Value ((Get-Date).ToString('o')) -Encoding ascii",
+  "}",
+  "",
+].join("\r\n");
+
+const ASAR_RENAME_WHEN_IDLE_PS1 = [
+  "param(",
+  "  [Parameter(Mandatory = $true)][string]$AsarPath,",
+  "  [Parameter(Mandatory = $true)][string]$ExePath,",
+  "  [Parameter(Mandatory = $true)][string]$LockPath",
+  ")",
+  "$ErrorActionPreference = 'Continue'",
+  "$deadline = (Get-Date).AddMinutes(30)",
+  "while ((Get-Date) -lt $deadline) {",
+  "  if (Test-Path -LiteralPath (Join-Path $env:TEMP 'dsh-purge-official-restarting')) { exit 0 }",
+  "  $holding = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -eq $ExePath } catch { $false } })",
+  "  if ($holding.Count -gt 0) { Start-Sleep -Milliseconds 500; continue }",
+  "  if (-not (Test-Path -LiteralPath $AsarPath)) {",
+  "    Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue",
+  "    exit 0",
+  "  }",
+  "  $appDir = Join-Path (Split-Path -Parent $AsarPath) 'app'",
+  "  $unpacked = $AsarPath + '.unpacked'",
+  "  $marker = Join-Path $appDir 'dsh\\node_modules\\node-addon-require-builtin-win32-x64-msvc\\prebuilt\\win32-x64-msvc-napi-v9.node'",
+  "  if ((Test-Path -LiteralPath $unpacked) -and -not (Test-Path -LiteralPath $marker)) {",
+  "    & robocopy.exe $unpacked $appDir /E /XC /XN /XO /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null",
+  "  }",
+  "  $bak = \"$AsarPath.bak\"",
+  "  if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }",
+  "  try {",
+  "    Move-Item -LiteralPath $AsarPath -Destination $bak -Force -ErrorAction Stop",
+  "  } catch {",
+  "    Start-Sleep -Milliseconds 400",
+  "    continue",
+  "  }",
+  "  Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue",
+  "  Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue",
+  "  Start-Process -FilePath $ExePath",
+  "  exit 0",
+  "}",
+  "Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue",
+  "",
+].join("\r\n");
+
+const ASAR_RENAME_WHEN_IDLE_SH = [
+  "#!/bin/sh",
+  "asar=$1",
+  "exe=$2",
+  "lock=$3",
+  "deadline=$(($(date +%s) + 1800))",
+  "relaunch() {",
+  "  unset ELECTRON_RUN_AS_NODE",
+  "  case \"$(uname -s)\" in",
+  "    Darwin)",
+  "      case \"$exe\" in",
+  "        */Contents/MacOS/*)",
+  "          bundle=$(dirname \"$(dirname \"$(dirname \"$exe\")\")\")",
+  "          open \"$bundle\"",
+  "          return",
+  "          ;;",
+  "      esac",
+  "      ;;",
+  "  esac",
+  "  nohup \"$exe\" >/dev/null 2>&1 &",
+  "}",
+  "while [ \"$(date +%s)\" -lt \"$deadline\" ]; do",
+  "  if [ ! -e \"$asar\" ]; then",
+  "    rm -f \"$lock\"",
+  "    exit 0",
+  "  fi",
+  "  bak=\"$asar.bak\"",
+  "  rm -f \"$bak\"",
+  "  if mv \"$asar\" \"$bak\" 2>/dev/null; then",
+  "    rm -f \"$lock\"",
+  "    relaunch",
+  "    exit 0",
+  "  fi",
+  "  sleep 1",
+  "done",
+  "rm -f \"$lock\"",
+  "exit 1",
+  "",
+].join("\n");
+
+/** 官方壳开着时 app.asar 被占用。不结束进程，等用户退出后再改名并重新打开。 */
+export function scheduleAsarRenameWhenIdle({ exe, asar } = {}) {
+  if (!exe || !asar) return { pending: false };
+  const lock = `${asar}.rename-pending`;
+  try {
+    const age = Date.now() - fs.statSync(lock).mtimeMs;
+    if (age >= 0 && age < 30 * 60 * 1000) return { pending: true, already: true };
+  } catch {
+    // 没有待处理标记，下面新建。
+  }
+  fs.writeFileSync(lock, `${Date.now()}\n`, "utf8");
+  if (process.platform === "win32") {
+    const script = path.join(os.tmpdir(), "dsh-purge-asar-rename-when-idle.ps1");
+    fs.writeFileSync(script, ASAR_RENAME_WHEN_IDLE_PS1, "utf8");
+    const child = spawn(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        script,
+        "-AsarPath",
+        asar,
+        "-ExePath",
+        exe,
+        "-LockPath",
+        lock,
+      ],
+      { detached: true, stdio: "ignore", windowsHide: true, shell: false },
+    );
+    child.unref();
+    return { pending: true };
+  }
+  const script = path.join(os.tmpdir(), "dsh-purge-asar-rename-when-idle.sh");
+  fs.writeFileSync(script, ASAR_RENAME_WHEN_IDLE_SH, { encoding: "utf8", mode: 0o755 });
+  const child = spawn("/bin/sh", [script, asar, exe, lock], {
+    detached: true,
+    stdio: "ignore",
+    shell: false,
+  });
+  child.unref();
+  return { pending: true };
+}
+
+/** 等当前桌面进程退出后把 app.asar 挪走，再启动 exe。解开后的 resources\\app 才会被加载。 */
+export function scheduleAsarSwapRestart({ exe, asar, waitPid = process.pid, exit = false } = {}) {
+  if (!exe || !asar) throw new Error("缺少桌面 exe 或 app.asar，无法重启");
+  if (process.platform === "darwin") {
+    const helper = fileURLToPath(new URL("./restart-desktop.js", import.meta.url));
+    spawnHelper(helper, { respawn: true, killApp: true, asar, waitPid }, { exit: false });
+    if (exit !== false) setTimeout(() => process.exit(0), 800);
+    return { scheduled: true };
+  }
+  if (process.platform !== "win32") return scheduleAsarRenameWhenIdle({ exe, asar });
+  const script = path.join(os.tmpdir(), `dsh-purge-asar-swap-${process.pid}.ps1`);
+  fs.writeFileSync(script, ASAR_SWAP_PS1, "utf8");
+  const child = spawn(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      script,
+      "-WaitPid",
+      String(waitPid),
+      "-AsarPath",
+      asar,
+      "-ExePath",
+      exe,
+    ],
+    { detached: true, stdio: "ignore", windowsHide: true, shell: false },
+  );
+  child.unref();
+  if (exit !== false) setTimeout(() => process.exit(0), 800);
+  return { scheduled: true };
+}
+
+function officialExeFromProcess() {
+  // macOS / Linux 的重启走宿主 requestRestart。这里的 wscript 只服务 Windows 官方包。
+  if (process.platform !== "win32") return "";
+  if (isOfficialHarnessExecutable(process.execPath)) return path.normalize(process.execPath);
+  const resources = process.resourcesPath;
+  if (!resources) return "";
+  const beside = path.join(path.dirname(resources), "DeepSeek Harness.exe");
+  return fs.existsSync(beside) ? beside : "";
+}
+
+function dshHomeForRelaunch() {
+  const current = String(process.env.DSH_HOME || "").replace(/[\\/]+$/, "");
+  if (!current) return "";
+  if (current.toLowerCase().endsWith(".dsh")) return current;
+  const nested = path.join(current, ".dsh");
+  try {
+    if (fs.existsSync(path.join(nested, "profiles"))) return nested;
+  } catch {
+    // 用当前值。
+  }
+  return current;
+}
+
+export function scheduleRestart(request, ctx, _options = {}) {
+  const exe =
+    officialExeFromProcess() ||
+    findDesktopAppExecutable() ||
+    "";
+  const asar = exe ? appAsarPath(exe) : "";
+  if (process.platform === "win32" && exe && isOfficialHarnessExecutable(exe)) {
+    return restartOfficialHarness({ exe, asar });
+  }
+  if (exe && asar && asarArchiveIsFile(asar)) {
+    scheduleAsarSwapRestart({ exe, asar, waitPid: process.pid, exit: true });
+    return { restarting: true, asarSwap: true };
+  }
+  const runtime = desktopRuntimeOf(ctx);
+  if (runtime) {
+    // 只走桌面整应用 relaunch，不要 exit Host（那会先把内嵌 web 单独拉起来）。
+    Promise.resolve(runtime.requestRestart()).catch((err) => {
+      console.warn("[dsh-purge] desktop requestRestart failed:", err);
+    });
+    return { restarting: true };
+  }
+  const helper = fileURLToPath(new URL("./restart-desktop.js", import.meta.url));
+  spawnHelper(helper, { respawn: true, killApp: true }, { exit: false });
+  return { restarting: true };
+}
+
+function jsString(value) {
+  return wshLiteral(value);
+}
+
+function officialRestartScript(exe, asar, dshHome) {
+  const log = path.join(os.tmpdir(), "dsh-purge-official-restart.log");
+  return [
+    "var exe = " + jsString(exe) + ";",
+    "var asar = " + jsString(asar) + ";",
+    "var home = " + jsString(dshHome || "") + ";",
+    "var logPath = " + jsString(log) + ";",
+    "var fso = new ActiveXObject('Scripting.FileSystemObject');",
+    "var sh = new ActiveXObject('WScript.Shell');",
+    "var wmi = GetObject('winmgmts:\\\\\\\\.\\\\root\\\\cimv2');",
+    "function z(n) { return (n < 10 ? '0' : '') + n; }",
+    "function stamp() { var d = new Date(); return d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate()) + 'T' + z(d.getHours()) + ':' + z(d.getMinutes()) + ':' + z(d.getSeconds()); }",
+    "function log(m) { var f = fso.OpenTextFile(logPath, 8, true); f.WriteLine(stamp() + ' ' + m); f.Close(); }",
+    "function samePath(a, b) { return String(a || '').replace(/\\//g, '\\\\').toLowerCase() === String(b || '').replace(/\\//g, '\\\\').toLowerCase(); }",
+    "function installRoot() { return fso.GetParentFolderName(exe); }",
+    "function pids() { var out = []; var root = String(installRoot() || '').replace(/\\//g, '\\\\').toLowerCase(); var e = new Enumerator(wmi.ExecQuery(\"SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE Name = 'DeepSeek Harness.exe'\")); for (; !e.atEnd(); e.moveNext()) { var p = e.item(); var ep = String(p.ExecutablePath || '').replace(/\\//g, '\\\\').toLowerCase(); if (samePath(p.ExecutablePath, exe) || (root && ep.indexOf(root) === 0)) out.push(p.ProcessId); } return out; }",
+    "log('begin');",
+    "var promptFile = asar.replace(/app\\.asar$/i, 'app') + '\\\\dsh\\\\node_modules\\\\@deepseek-ai\\\\dsh-system-prompt\\\\lib\\\\index.js';",
+    "var clean = false;",
+    "if (fso.FileExists(promptFile)) { var tf = fso.OpenTextFile(promptFile, 1); var body = tf.ReadAll(); tf.Close(); clean = body.indexOf('[dsh-purge] identity stripped') >= 0 && body.indexOf('[dsh-purge] complete prompt keeps inject') >= 0; }",
+    "if (!clean) log('clean markers missing; not starting');",
+    "if (clean) {",
+    "log('clean markers ok');",
+    "WScript.Sleep(800);",
+    "var list = pids();",
+    "log('pids ' + list.join(','));",
+    "for (var i = 0; i < list.length; i++) sh.Run('taskkill.exe /F /PID ' + list[i], 0, true);",
+    "sh.Run('taskkill.exe /F /T /IM DeepSeek Harness.exe', 0, true);",
+    "sh.Run('taskkill.exe /F /T /IM DSH Desktop.exe', 0, true);",
+    "var deadline = new Date().getTime() + 20000;",
+    "var left = list;",
+    "while (new Date().getTime() < deadline) { left = pids(); if (left.length === 0) break; WScript.Sleep(200); }",
+    "log('left ' + left.length);",
+    "var unpacked = asar + '.unpacked';",
+    "var appDir = asar.replace(/app\\.asar$/i, 'app');",
+    "var marker = appDir + '\\\\dsh\\\\node_modules\\\\node-addon-require-builtin-win32-x64-msvc\\\\prebuilt\\\\win32-x64-msvc-napi-v9.node';",
+    "if (fso.FolderExists(unpacked) && !fso.FileExists(marker)) { sh.Run('robocopy.exe \"' + unpacked + '\" \"' + appDir + '\" /E /XC /XN /XO /NFL /NDL /NJH /NJS /nc /ns /np', 0, true); log('overlay'); }",
+    "var renamed = false;",
+    "if (!fso.FileExists(asar)) { renamed = true; log('asar already absent'); }",
+    "if (fso.FileExists(asar)) { var bak = asar + '.bak'; if (fso.FileExists(bak)) fso.DeleteFile(bak, true); for (var n = 0; n < 80; n++) { try { fso.MoveFile(asar, bak); renamed = true; log('renamed'); break; } catch (err) { log(err && err.message ? err.message : String(err)); if (n === 20 || n === 50) { sh.Run('taskkill.exe /F /T /IM DeepSeek Harness.exe', 0, true); WScript.Sleep(800); } WScript.Sleep(300); } } }",
+    "if (!renamed) { log('rename failed; not starting'); }",
+    "if (renamed) {",
+    "try { sh.Environment('PROCESS').Remove('ELECTRON_RUN_AS_NODE'); } catch (ignore) {}",
+    "if (home) { try { sh.Environment('PROCESS').Item('DSH_HOME') = home; } catch (ignore2) {} }",
+    "sh.Run('\"' + exe + '\"', 1, false);",
+    "log('started');",
+    "}",
+    "}",
+    "",
+  ].join("\r\n");
+}
+
+function unpackedHostIsClean(exe) {
+  const appDir = appDirForExecutable(exe);
+  if (!appDir) return false;
+  const fp = path.join(appDir, "dsh", "node_modules", "@deepseek-ai", "dsh-system-prompt", "lib", "index.js");
+  try {
+    const text = fs.readFileSync(fp, "utf8");
+    return text.includes("[dsh-purge] identity stripped")
+      && text.includes("[dsh-purge] complete prompt keeps inject");
+  } catch {
+    return false;
+  }
+}
+
+/** 点「重启」后结束当前官方客户端，挪开被占用的 app.asar，再自己打开。 */
+export function restartOfficialHarness(options = {}) {
+  const hinted = options.exe ? path.normalize(String(options.exe)) : "";
+  const exe =
+    (hinted && isDesktopExecutable(hinted) ? hinted : "") ||
+    officialExeFromProcess() ||
+    findDesktopAppExecutable() ||
+    "";
+  if (!exe) return { restarting: false };
+  if (!isOfficialHarnessExecutable(exe)) {
+    const asar = options.asar || appAsarPath(exe);
+    if (asar && asarArchiveIsFile(asar)) {
+      scheduleAsarSwapRestart({
+        exe,
+        asar,
+        waitPid: process.pid,
+        exit: options.exit !== false,
+      });
+      return { restarting: true, asarSwap: true };
+    }
+    return { restarting: false };
+  }
+  // #57：不自动跑官方 installer。宿主版本百花齐放，更新交接由用户自己做；
+  // 插件只负责解包/补丁。旧逻辑会在落盘前误判失败并清掉 resources\app。
+  if (options.requireClean !== false && !unpackedHostIsClean(exe)) {
+    return { restarting: false, clean: false };
+  }
+  const asar = options.asar || appAsarPath(exe);
+  const asarPresent = Boolean(asar && asarArchiveIsFile(asar));
+  const swapLock = asar ? `${asar}.swap-lock` : "";
+  if (asarPresent && swapLock) {
+    try {
+      const age = Date.now() - fs.statSync(swapLock).mtimeMs;
+      if (age >= 0 && age < 90 * 1000) return { restarting: true, already: true, asarSwap: true };
+    } catch {
+      // 没有进行中的切换。
+    }
+    try { fs.writeFileSync(swapLock, `${Date.now()}\n`, "utf8"); } catch {}
+  }
+  const script = path.join(os.tmpdir(), "dsh-purge-official-restart.js");
+  const launcher = path.join(os.tmpdir(), "dsh-purge-official-restart.cmd");
+  const restartBody = officialRestartScript(exe, asar, dshHomeForRelaunch());
+  if (!isWshAscii(restartBody)) return { restarting: false };
+  fs.writeFileSync(script, restartBody, "utf8");
+  fs.writeFileSync(launcher, `@echo off\r\nstart "" wscript.exe //nologo //B "${script}"\r\n`, "utf8");
+  const child = spawn("cmd.exe", ["/d", "/c", launcher], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    shell: false,
+  });
+  child.unref();
+  return { restarting: true };
+}
+
+export function scheduleCleanupRestart({ cleanup = [], ctx } = {}) {
+  const src = fileURLToPath(new URL("./restart-desktop.js", import.meta.url));
+  const dest = path.join(os.tmpdir(), `dsh-purge-uninst-${process.pid}.mjs`);
+  fs.copyFileSync(src, dest);
+  const runtime = desktopRuntimeOf(ctx);
+  if (runtime) {
+    spawnHelper(dest, { cleanup, helper: dest, respawn: false }, { exit: false });
+    Promise.resolve(runtime.requestRestart()).catch((err) => {
+      console.warn("[dsh-purge] desktop uninstall restart failed:", err);
+    });
+    return { restarting: true };
+  }
+  spawnHelper(dest, { cleanup, helper: dest, respawn: true, killApp: true }, { exit: false });
+  return { restarting: true };
+}
+
+const CLI_ENTRY_BEGIN = "# dsh-purge cli entry begin";
+const CLI_ENTRY_END = "# dsh-purge cli entry end";
+const CLI_ASAR_ENTRY = "app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js";
+const CLI_DIR_ENTRY = "app/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js";
+
+function ensureAppRuntimeSymlink(resources) {
+  const appDir = path.join(resources, "app");
+  const runtime = path.join(resources, "runtime");
+  const link = path.join(appDir, "runtime");
+  if (!isDir(appDir) || !isDir(runtime)) return { ok: false, reason: "missing" };
+  try {
+    if (fs.existsSync(link)) {
+      const st = fs.lstatSync(link);
+      if (st.isSymbolicLink() || st.isDirectory()) return { ok: true, already: true };
+    }
+  } catch {
+    // create below
+  }
+  try {
+    try {
+      fs.rmSync(link, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+    if (process.platform === "win32") {
+      fs.symlinkSync("..\\runtime", link, "junction");
+      return { ok: true, created: true, type: "junction" };
+    }
+    fs.symlinkSync("../runtime", link, "dir");
+    return { ok: true, created: true, type: "dir" };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+function patchOfficialCliShimText(text) {
+  if (!text || !text.includes(CLI_ASAR_ENTRY)) return { changed: false, text };
+  if (text.includes(CLI_ENTRY_BEGIN) && text.includes('"$entry"')) {
+    return { changed: false, text, already: true };
+  }
+  const block = [
+    CLI_ENTRY_BEGIN,
+    `entry="$resources/${CLI_ASAR_ENTRY}"`,
+    'if [ ! -f "$entry" ]; then',
+    `  entry="$resources/${CLI_DIR_ENTRY}"`,
+    "fi",
+    CLI_ENTRY_END,
+    "",
+  ].join("\n");
+  let next = text;
+  if (!next.includes(CLI_ENTRY_BEGIN)) {
+    const insertAt = next.search(/ELECTRON_RUN_AS_NODE=1/);
+    if (insertAt >= 0) next = `${next.slice(0, insertAt)}${block}${next.slice(insertAt)}`;
+    else next = `${block}${next}`;
+  }
+  next = next.replace(
+    /"\$resources\/app\.asar\/dsh\/node_modules\/@deepseek-ai\/dsh-desktop-host\/lib\/cli\.js"/g,
+    '"$entry"',
+  );
+  next = next.replace(
+    /\$resources\/app\.asar\/dsh\/node_modules\/@deepseek-ai\/dsh-desktop-host\/lib\/cli\.js/g,
+    '"$entry"',
+  );
+  return { changed: next !== text, text: next };
+}
+
+function patchOfficialCliCmdText(text) {
+  if (!text) return { changed: false, text };
+  const hasAsar =
+    text.toLowerCase().includes("app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js") ||
+    text.includes(CLI_ASAR_ENTRY);
+  if (!hasAsar) return { changed: false, text };
+  if (text.includes("dsh-purge cli entry begin")) return { changed: false, text, already: true };
+  const asarWin = "%resources%\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js";
+  const dirWin = "%resources%\\app\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js";
+  let next = text;
+  const block = [
+    "REM dsh-purge cli entry begin",
+    `set "entry=${asarWin}"`,
+    `if not exist "%entry%" set "entry=${dirWin}"`,
+    "REM dsh-purge cli entry end",
+    "",
+  ].join("\r\n");
+  if (!next.includes("dsh-purge cli entry begin")) next = block + next;
+  next = next.replace(
+    /%resources%\\app\.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli\.js/gi,
+    "%entry%",
+  );
+  return { changed: next !== text, text: next };
+}
+
+/** 解包 app.asar 后修补官方 CLI：入口回退到 app/，并补 app/runtime → ../runtime。 */
+export function repairOfficialCliAfterUnpack(exe = findDesktopAppExecutable()) {
+  if (!exe || !isOfficialHarnessExecutable(exe)) return { ok: false, reason: "not_official" };
+  const resources = resourcesDirForExecutable(exe);
+  if (!resources || !isDir(resources)) return { ok: false, reason: "no_resources" };
+  const report = { ok: true, resources, symlink: null, shims: [] };
+  report.symlink = ensureAppRuntimeSymlink(resources);
+  const shimPaths = [
+    path.join(resources, "runtime", "cli", "bin", "dsh"),
+    path.join(resources, "runtime", "cli", "bin", "dsh.cmd"),
+  ];
+  for (const fp of shimPaths) {
+    if (!isFile(fp)) {
+      report.shims.push({ path: fp, status: "missing" });
+      continue;
+    }
+    let text = "";
+    try {
+      text = fs.readFileSync(fp, "utf8");
+    } catch (e) {
+      report.shims.push({ path: fp, status: "read_error", error: String(e && e.message ? e.message : e) });
+      continue;
+    }
+    const patched = fp.toLowerCase().endsWith(".cmd")
+      ? patchOfficialCliCmdText(text)
+      : patchOfficialCliShimText(text);
+    if (!patched.changed) {
+      report.shims.push({ path: fp, status: patched.already ? "already" : "skipped" });
+      continue;
+    }
+    try {
+      fs.writeFileSync(fp, patched.text, "utf8");
+      report.shims.push({ path: fp, status: "patched" });
+    } catch (e) {
+      report.shims.push({ path: fp, status: "write_error", error: String(e && e.message ? e.message : e) });
+    }
+  }
+  return report;
+}

@@ -1,0 +1,747 @@
+:root {
+  /* Matched to the kernel's own dark canvas (#151517) so the frame and the content read as
+     one surface instead of a widget pasted into a window. The light variant below is the
+     same idea against the kernel's light canvas (#fff). */
+  --bg: #151517;
+  --bg-elev: #111113;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.13);
+  --text: #ececee;
+  --text-dim: #a1a1a8;
+  --text-faint: #6b6b73;
+  --accent: #4ade9b;
+  --danger: #e5484d;
+  --titlebar-height: 38px;
+  --menu-bg: #1b1b1f;
+  --overlay: rgba(0, 0, 0, 0.42);
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    --bg: #ffffff;
+    --bg-elev: #f4f4f5;
+    --line: rgba(0, 0, 0, 0.08);
+    --line-strong: rgba(0, 0, 0, 0.14);
+    --text: #1b1b1f;
+    --text-dim: #56565e;
+    --text-faint: #8a8a92;
+    --accent: #0f9d63;
+    --danger: #d93a3f;
+    --menu-bg: #ffffff;
+    --overlay: rgba(0, 0, 0, 0.18);
+    color-scheme: light;
+  }
+}
+
+:root[data-theme='light'] {
+  --bg: #ffffff;
+  --bg-elev: #f4f4f5;
+  --line: rgba(0, 0, 0, 0.08);
+  --line-strong: rgba(0, 0, 0, 0.14);
+  --text: #1b1b1f;
+  --text-dim: #56565e;
+  --text-faint: #8a8a92;
+  --accent: #0f9d63;
+  --danger: #d93a3f;
+  --menu-bg: #ffffff;
+  --overlay: rgba(0, 0, 0, 0.18);
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+.frame {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* ── title bar ─────────────────────────────────────────────── */
+
+.titlebar {
+  height: var(--titlebar-height);
+  flex: 0 0 var(--titlebar-height);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 14px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 6px;
+  -webkit-app-region: no-drag;
+}
+
+.brand-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: background 200ms ease, box-shadow 200ms ease;
+}
+
+.brand-dot[data-status='ready'] {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.55);
+}
+
+.brand-dot[data-status='failed'] {
+  background: var(--danger);
+}
+
+.brand-dot[data-status='starting'] {
+  background: var(--text-dim);
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+.brand-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-dim);
+}
+
+.unread-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px rgba(74, 222, 155, 0.8);
+}
+
+.titlebar-drag {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  -webkit-app-region: drag;
+}
+
+.titlebar-title {
+  max-width: 70%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.titlebar-meta {
+  display: flex;
+  align-items: center;
+  padding-right: 10px;
+  -webkit-app-region: no-drag;
+}
+
+.port {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+}
+
+.titlebar-actions {
+  display: flex;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.win-button {
+  width: 44px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  cursor: default;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.win-button:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.win-button-close:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* ── content ───────────────────────────────────────────────── */
+
+.surface {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.kernel-view {
+  /* Absolute rather than height:100%: the parent is a flex item with an auto height, and a
+     percentage height against it resolves to nothing — which is how a <webview> ends up
+     150px tall no matter what the window does. */
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* ── boot ──────────────────────────────────────────────────── */
+
+.boot {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+}
+
+.boot-inner {
+  width: min(520px, 82vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 10px;
+}
+
+.pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.5);
+  animation: halo 2s ease-out infinite;
+  margin-bottom: 6px;
+}
+
+.pulse-failed {
+  background: var(--danger);
+  box-shadow: none;
+  animation: none;
+}
+
+.boot-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+.boot-sub {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.7;
+  max-width: 42ch;
+}
+
+.boot-version {
+  margin-top: 18px;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.action {
+  margin-top: 8px;
+  padding: 7px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--accent);
+  font-size: 12.5px;
+  cursor: default;
+}
+
+.action:hover {
+  background: rgba(52, 211, 153, 0.18);
+}
+
+.ghost {
+  margin-top: 4px;
+  padding: 4px 10px;
+  border: 0;
+  background: none;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  cursor: default;
+}
+
+.ghost:hover {
+  color: var(--text-dim);
+}
+
+.boot-log {
+  margin: 10px 0 0;
+  width: 100%;
+  max-height: 34vh;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  text-align: left;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ── loading curtain over the kernel view ──────────────────── */
+
+.view-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  animation: fade-in 140ms ease;
+}
+
+.view-loading-bar {
+  width: 132px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: sweep 1.15s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateX(-64px);
+    opacity: 0.15;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(64px);
+    opacity: 0.15;
+  }
+}
+
+/* ── overlays: command palette & settings ──────────────────── */
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--overlay);
+  backdrop-filter: blur(6px);
+  animation: fade-in 140ms ease;
+}
+
+.palette {
+  width: min(560px, 86vw);
+  transform: translateY(-8vh);
+  background: var(--menu-bg);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.palette-input {
+  width: 100%;
+  padding: 14px 16px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 13.5px;
+  font-family: inherit;
+  outline: none;
+}
+
+.palette-input::placeholder {
+  color: var(--text-faint);
+}
+
+.palette-list {
+  max-height: 44vh;
+  overflow: auto;
+  padding: 6px;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: default;
+}
+
+.palette-item[data-active='true'] {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.palette-hint {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+}
+
+.palette-section {
+  padding-bottom: 4px;
+}
+
+.palette-group {
+  padding: 8px 12px 4px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.palette-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.palette-empty {
+  padding: 18px;
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: center;
+}
+
+.settings {
+  width: min(600px, 86vw);
+  max-height: 72vh;
+  overflow: auto;
+  background: var(--menu-bg);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+  padding-bottom: 14px;
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-header h2 {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 16px 4px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  font-size: 12.5px;
+}
+
+.settings-label {
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+.segmented {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+}
+
+.segment {
+  flex: 1;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: default;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.segment:hover {
+  color: var(--text);
+}
+
+.segment[data-active='true'] {
+  background: var(--menu-bg);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stepper-button {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: default;
+}
+
+.stepper-button:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.stepper-value {
+  min-width: 42px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.shortcut {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.shortcut-title {
+  flex: 1;
+  color: var(--text-dim);
+}
+
+.shortcut-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+kbd {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+}
+
+.about {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-faint);
+}
+
+.button-row {
+  display: flex;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.switch {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  padding: 0;
+  border-radius: 11px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-elev);
+  cursor: default;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.switch[data-on='true'] {
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: transform 140ms ease, background 140ms ease;
+}
+
+.switch[data-on='true'] .switch-thumb {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+.settings-log {
+  margin: 4px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.settings-value {
+  color: var(--text-dim);
+  text-align: right;
+  word-break: break-all;
+}
+
+.settings-value.is-mono {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 11.5px;
+}
+
+/* ── crash fallback ────────────────────────────────────────── */
+
+.crash {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.crash-inner {
+  width: min(520px, 82vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+}
+
+.crash-mark {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--danger);
+  margin-bottom: 6px;
+}
+
+.crash-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.crash-sub {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-dim);
+  word-break: break-word;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes halo {  0% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 9px rgba(52, 211, 153, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0);
+  }
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
