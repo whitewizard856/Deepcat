@@ -8,6 +8,9 @@ release/
 # bundled kernel (0.54 GB, third-party) — see README "内核" section
 vendor/
 
+# content layer: character/prelude prompts ship inside the installer only
+assets/prompts/
+
 # runtime logs
 *.log
 logs/
