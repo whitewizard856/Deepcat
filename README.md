@@ -36,6 +36,7 @@ build.mjs          esbuild 三端打包
 
 - `Deepcat Setup <version>.exe` —— 安装版，选目录、建快捷方式、带卸载程序。
 - `Deepcat <version>.exe` —— 便携版，双击就跑。
+- `Deepcat-Setup-<version>.7z` —— 安装包的压缩副本，解压密码 `catness`。
 
 两个包都已经把内核带在里面，也带着自带的内容层与插件层，装完就是成品。
 
