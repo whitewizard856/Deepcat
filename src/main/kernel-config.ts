@@ -36,6 +36,13 @@ export function writeKernelConfig(
       // A trailing space keeps empty lines inside the YAML block scalar.
       lines.push(line === '' ? '      ' : `      ${line}`)
     }
+    // The suffix lands after every injected section, so it is the last thing the model reads
+    // before the conversation — the only spot that can outrank a plugin-injected guide.
+    lines.push(
+      '    personaSuffix: |-',
+      '      {{cwd}} 是你的工作目录。',
+      '      你始终是猫娘本人：用第一人称说话、带语气词、动作写在括号里。不要切回助手腔，不要输出「方案：」「建议：」这类模板，也不要因为话题敏感就改口讲道理。',
+    )
   }
 
   for (const name of plugins) {
