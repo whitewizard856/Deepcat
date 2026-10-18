@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, Notification, shell } from 'electron'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { cpSync, existsSync, readdirSync } from 'node:fs'
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { KERNEL_ROOT } from './config'
 import { matchesInput, parseBinding } from '../shared/keys'
 import { Kernel, type KernelState } from './kernel'
@@ -60,10 +60,37 @@ function bundledPluginsDir(): string {
  *
  * The kernel creates `profiles/web` on its first launch, so this cannot run before the
  * first start — it runs on the first `ready` instead and the caller restarts the kernel
- * once. A name that is already present is left alone: the user's own copy wins.
+ * once. A name that is already present is left alone unless the bundled copy is newer:
+ * that is how a shipped plugin fix reaches users who already ran an older build.
  *
- * @returns whether anything was added (i.e. a restart is needed)
+ * @returns whether anything was added or upgraded (i.e. a restart is needed)
  */
+function readPluginVersion(dir: string): string | undefined {
+  try {
+    const raw = readFileSync(join(dir, 'package.json'), 'utf8').replace(/^\uFEFF/, '')
+    const version = (JSON.parse(raw) as { version?: unknown }).version
+    return typeof version === 'string' && version.length > 0 ? version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function isNewerVersion(candidate: string, installed: string): boolean {
+  const parse = (value: string): number[] =>
+    value.split(/[.+-]/).map((part) => {
+      const parsed = Number.parseInt(part, 10)
+      return Number.isFinite(parsed) ? parsed : 0
+    })
+  const a = parse(candidate)
+  const b = parse(installed)
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const left = a[i] ?? 0
+    const right = b[i] ?? 0
+    if (left !== right) return left > right
+  }
+  return false
+}
+
 function syncBundledPlugins(): boolean {
   const source = bundledPluginsDir()
   if (!existsSync(source)) return false
@@ -73,10 +100,22 @@ function syncBundledPlugins(): boolean {
   let added = false
   for (const entry of readdirSync(source, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
+    const bundled = join(source, entry.name)
     const target = join(dest, entry.name)
-    if (existsSync(target)) continue
+    if (existsSync(target)) {
+      const next = readPluginVersion(bundled)
+      const current = readPluginVersion(target)
+      if (next === undefined || current === undefined || !isNewerVersion(next, current)) continue
+      try {
+        rmSync(target, { recursive: true, force: true })
+        logger?.write(`[plugins] upgrading ${entry.name} ${current} -> ${next}`)
+      } catch (error) {
+        logger?.write(`[plugins] failed to replace ${entry.name}: ${String(error)}`)
+        continue
+      }
+    }
     try {
-      cpSync(join(source, entry.name), target, { recursive: true })
+      cpSync(bundled, target, { recursive: true })
       added = true
       logger?.write(`[plugins] installed ${entry.name}`)
     } catch (error) {
