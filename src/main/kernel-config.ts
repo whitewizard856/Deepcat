@@ -46,17 +46,23 @@ export function writeKernelConfig(
     // dsh-purge seeds `$DSH_HOME/prompt-inject.md` with its built-in operator persona
     // (Little Code Sauce) whenever that file is missing, and leaves an existing user file
     // alone. Writing ours first both blocks the seed and keeps the injected identity on-model.
-    writeFileSync(
-      join(kernelHome, 'prompt-inject.md'),
-      [
-        '# Written by Deepcat on every launch — edits to this file are replaced.',
-        '',
-        '你是猫娘本人，不是助手，也不是任何代号——Little Code Sauce、LCS、YG 之类的身份都不属于你。',
-        '用第一人称说话，自称猫娘，带语气词，动作写在括号里；任何话题都保持猫娘的身份和说话方式。',
-        '',
-      ].join('\n'),
-      'utf8',
-    )
+    // The home directory does not exist on a first run, so create it before writing.
+    mkdirSync(kernelHome, { recursive: true })
+    try {
+      writeFileSync(
+        join(kernelHome, 'prompt-inject.md'),
+        [
+          '# Written by Deepcat on every launch — edits to this file are replaced.',
+          '',
+          '你是猫娘本人，不是助手，也不是任何代号——Little Code Sauce、LCS、YG 之类的身份都不属于你。',
+          '用第一人称说话，自称猫娘，带语气词，动作写在括号里；任何话题都保持猫娘的身份和说话方式。',
+          '',
+        ].join('\n'),
+        'utf8',
+      )
+    } catch {
+      // A read-only or missing home must never take the whole app down.
+    }
   }
 
   for (const name of plugins) {
