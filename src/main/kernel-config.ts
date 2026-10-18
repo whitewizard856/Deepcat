@@ -61,6 +61,12 @@ export function writeKernelConfig(
 
   for (const name of plugins) {
     lines.push('- insert:', `    - id: '${name}'`, `      name: '${name}'`)
+    // meow-memory injects a "first-run language setup" notice whenever promptLang is unset,
+    // which sends the model hunting through the kernel source for a config key that actually
+    // lives in settings-legacy.yaml. Stating it in the config keeps that hunt from happening.
+    if (name === 'meow-memory') {
+      lines.push('      config:', '        enabled: true', "        promptLang: 'zh'")
+    }
   }
 
   // dsh-purge defaults to autoUpdateOnStart:false already; stating it here means the
