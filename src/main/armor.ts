@@ -4,11 +4,14 @@ import { join } from 'node:path'
 /** Order matters: the full injection first, then the authorship frame and style rules. */
 /** Order matters: world frame, authorisation, character, then the seeded history. */
 const PROMPT_FILES = [
+  '00-header.md',
   'creative.md',
   'allow-exec.md',
   'uncensored.md',
   'novelist.md',
+  '99-format.md',
   'character.md',
+  '98-attachment.md',
   'prelude.md',
 ]
 

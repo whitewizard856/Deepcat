@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, Notification, shell } from 'electron'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { KERNEL_ROOT } from './config'
 import { matchesInput, parseBinding } from '../shared/keys'
 import { Kernel, type KernelState } from './kernel'
@@ -126,11 +126,42 @@ function syncBundledPlugins(): boolean {
 }
 
 /** Rewrites the kernel patch from the current appearance + armour switch. */
+function bundledPresetsDir(): string {
+  // Presets ship beside the asar for the same reason plugins do: the kernel reads them from
+  // the filesystem, and Electron's asar filesystem is read-only.
+  return app.isPackaged
+    ? join(process.resourcesPath, 'presets')
+    : join(__dirname, '..', '..', 'assets', 'presets')
+}
+
+/** Agent presets are filesystem-based: the kernel picks them up from `$DSH_HOME/.agent-presets`. */
+function syncBundledPresets(): void {
+  const source = bundledPresetsDir()
+  if (!existsSync(source)) return
+  const dest = join(kernelHome(), '.agent-presets')
+  try {
+    mkdirSync(dest, { recursive: true })
+  } catch {
+    return
+  }
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const target = join(dest, entry.name)
+    try {
+      rmSync(target, { recursive: true, force: true })
+      cpSync(join(source, entry.name), target, { recursive: true })
+    } catch (error) {
+      logger?.write(`[presets] failed to sync ${entry.name}: ${String(error)}`)
+    }
+  }
+}
+
 function refreshKernelConfig(): void {
   const userData = app.getPath('userData')
   const appearance = readAppearance(userData)
   const persona = readArmor(userData) ? buildPersonaPrefix(promptsDir()) : null
-  writeKernelConfig(kernelHome(), appearance, persona, BUILTIN_PLUGINS)
+  syncBundledPresets()
+  writeKernelConfig(kernelHome(), appearance, persona, BUILTIN_PLUGINS, join(bundledPresetsDir(), 'templates'))
 }
 
 function createWindow(): BrowserWindow {
