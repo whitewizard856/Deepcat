@@ -110,6 +110,8 @@ export function App(): React.ReactElement {
   const [unread, setUnread] = useState(false)
   const viewRef = useRef<HTMLElement | null>(null)
   const turnBusy = useRef(false)
+  const turnStartedAt = useRef(0)
+  const lastNotifyAt = useRef(0)
 
   useEffect(() => {
     void window.dsh.kernel.snapshot().then(setState)
@@ -170,17 +172,24 @@ export function App(): React.ReactElement {
       if (detail.channel === 'turn-state') {
         const running = detail.args?.[0] === true
         if (running) {
+          if (!turnBusy.current) turnStartedAt.current = Date.now()
           turnBusy.current = true
           return
         }
         if (!turnBusy.current) return
         turnBusy.current = false
         refreshSessions()
+        // A composer that flips busy for a fraction of a second is repainting, not working:
+        // notifying on those was what made the toast fire over and over.
+        if (Date.now() - turnStartedAt.current < 1500) return
         // Only when the user is elsewhere: a notification for a turn you just watched is
         // noise. The dot in the title bar is the in-window counterpart of that notification.
         if (!document.hasFocus()) {
           setUnread(true)
-          window.dsh.app.notify('Deepcat', '这一轮跑完了。')
+          if (localStorage.getItem('deepcat.notifyDone') !== '0' && Date.now() - lastNotifyAt.current >= 20_000) {
+            lastNotifyAt.current = Date.now()
+            window.dsh.app.notify('Deepcat', '这一轮跑完了。')
+          }
         }
       }
     }
@@ -696,6 +705,7 @@ function SettingsPanel({
   } | null>(null)
   const [home, setHome] = useState('')
   const [loginItem, setLoginItem] = useState(false)
+  const [notifyDone, setNotifyDone] = useState(() => localStorage.getItem('deepcat.notifyDone') !== '0')
   const [showLog, setShowLog] = useState(false)
   const [recording, setRecording] = useState<string | null>(null)
 
@@ -786,6 +796,21 @@ function SettingsPanel({
                 void window.dsh.app.setLoginItem(!loginItem).then(setLoginItem)
               }}
               aria-label="开机自启"
+            >
+              <span className="switch-thumb" />
+            </button>
+          </div>
+          <div className="settings-row">
+            <span className="settings-label">跑完了弹通知</span>
+            <button
+              className="switch"
+              data-on={notifyDone}
+              onClick={() => {
+                const next = !notifyDone
+                setNotifyDone(next)
+                localStorage.setItem('deepcat.notifyDone', next ? '1' : '0')
+              }}
+              aria-label="跑完了弹通知"
             >
               <span className="switch-thumb" />
             </button>
