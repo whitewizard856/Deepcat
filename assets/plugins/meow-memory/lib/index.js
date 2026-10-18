@@ -3964,7 +3964,7 @@ function registerMemoryTools(register, dir = ".dsh-meow") {
 }
 
 // src/dream.ts
-var PLUGIN_SOURCE = { kind: "plugin", plugin: "meow-memory" };
+var PLUGIN_SOURCE = { kind: "plugin:meow-memory" };
 var DREAM_MARKER = "[meow-memory-dream]";
 function shortSessionId(sid) {
   return (sid.startsWith("session-") ? sid.slice(8) : sid).slice(0, 8);
@@ -4563,7 +4563,7 @@ function migrateLegacy(db, workspace, dir = ".dsh-meow") {
 }
 
 // src/reflect.ts
-var PLUGIN_SOURCE2 = { kind: "plugin", plugin: "meow-memory" };
+var PLUGIN_SOURCE2 = { kind: "plugin:meow-memory" };
 var REFLECT_MARKER = "[meow-memory-reflect]";
 function scanTurn(events) {
   let startIdx = 0;
@@ -4731,8 +4731,7 @@ function createMemorySnapshotMessage(text, meta) {
   return createUserMessage({
     content: [{ type: "text", text }],
     source: {
-      kind: "plugin",
-      plugin: "meow-memory",
+      kind: "plugin:meow-memory",
       form: "snapshot",
       sections: [encodeMetaSection(meta), { name: "\u957F\u671F\u8BB0\u5FC6", text }]
     }
@@ -4742,8 +4741,7 @@ function createMemoryNoticeMessage(text) {
   return createUserMessage({
     content: [{ type: "text", text }],
     source: {
-      kind: "plugin",
-      plugin: "meow-memory",
+      kind: "plugin:meow-memory",
       form: "notice",
       summary: boundContextSummary(text.replace(/\s+/g, " ").trim())
     }

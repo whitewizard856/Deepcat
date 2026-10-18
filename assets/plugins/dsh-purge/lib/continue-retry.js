@@ -116,8 +116,7 @@ export function makeContinueMessage(text) {
     role: "user",
     content: [{ type: "text", text: body }],
     source: {
-      kind: "plugin",
-      plugin: "dsh-purge",
+      kind: "plugin:dsh-purge",
       form: "notice",
       summary: "continue",
     },
