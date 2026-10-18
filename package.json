@@ -1,7 +1,7 @@
 {
   "name": "dsh-shell",
   "productName": "Deepcat",
-  "version": "2.0.9",
+  "version": "2.1.4",
   "private": true,
   "description": "Deepcat - a desktop shell for DeepSeek Harness",
   "license": "MIT",
